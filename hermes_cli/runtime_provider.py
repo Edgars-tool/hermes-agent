@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +159,66 @@ def _host_derived_api_key(base_url: str) -> str:
     return (os.getenv(env_name, "") or "").strip()
 
 
+def _is_wsl() -> bool:
+    """Return True when Hermes is running inside WSL."""
+    if os.getenv("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+    except Exception:
+        return False
+
+
+def _wsl_windows_host_ip() -> str:
+    """Return the Windows host IP that WSL2 uses for NAT-mode host access."""
+    if not _is_wsl():
+        return ""
+    try:
+        for line in Path("/etc/resolv.conf").read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line.startswith("nameserver "):
+                continue
+            candidate = line.split(maxsplit=1)[1].strip()
+            if candidate and candidate != "127.0.0.1":
+                return candidate
+    except Exception:
+        pass
+    return ""
+
+
+def _rewrite_host_docker_internal_for_wsl(base_url: str) -> str:
+    """Rewrite host.docker.internal to the WSL Windows host IP when needed."""
+    if not base_url or not _is_wsl():
+        return base_url
+    if not base_url_host_matches(base_url, "host.docker.internal"):
+        return base_url
+
+    windows_host_ip = _wsl_windows_host_ip()
+    if not windows_host_ip:
+        return base_url
+
+    parsed = urlparse(base_url)
+    if not parsed.scheme:
+        return base_url
+    host_port = windows_host_ip
+    if parsed.port:
+        host_port = f"{windows_host_ip}:{parsed.port}"
+    path = parsed.path or ""
+    rewritten = f"{parsed.scheme}://{host_port}{path}"
+    if parsed.params:
+        rewritten += f";{parsed.params}"
+    if parsed.query:
+        rewritten += f"?{parsed.query}"
+    if parsed.fragment:
+        rewritten += f"#{parsed.fragment}"
+    logger.info(
+        "Rewriting host.docker.internal to WSL Windows host IP %s for base URL %s",
+        windows_host_ip,
+        base_url,
+    )
+    return rewritten
+
+
 def _auto_detect_local_model(base_url: str) -> str:
     """Query a local server for its model name when only one model is loaded."""
     if not base_url:
@@ -304,6 +366,7 @@ def _resolve_runtime_from_pool_entry(
     # config.default was still a Claude model.
     effective_model = (target_model or model_cfg.get("default") or "")
     base_url = (getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or "").rstrip("/")
+    base_url = _rewrite_host_docker_internal_for_wsl(base_url)
     api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
     api_mode = "chat_completions"
     if provider == "openai-codex":
@@ -648,6 +711,7 @@ def _resolve_named_custom_runtime(
             pass
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
+        base_url = _rewrite_host_docker_internal_for_wsl(base_url)
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
@@ -688,6 +752,7 @@ def _resolve_named_custom_runtime(
         (explicit_base_url or "").strip()
         or custom_provider.get("base_url", "")
     ).rstrip("/")
+    base_url = _rewrite_host_docker_internal_for_wsl(base_url)
     if not base_url:
         return None
 
@@ -796,6 +861,7 @@ def _resolve_openrouter_runtime(
         or env_openrouter_base_url
         or OPENROUTER_BASE_URL
     ).rstrip("/")
+    base_url = _rewrite_host_docker_internal_for_wsl(base_url)
 
     # Choose API key based on whether the resolved base_url targets OpenRouter.
     # When hitting OpenRouter, prefer OPENROUTER_API_KEY (issue #289).

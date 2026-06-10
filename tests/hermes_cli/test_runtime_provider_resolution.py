@@ -2468,6 +2468,26 @@ def test_custom_alias_with_loopback_base_url_routes_to_custom(monkeypatch):
     assert resolved["base_url"] == "http://localhost:11434/v1"
 
 
+def test_host_docker_internal_rewrites_to_wsl_windows_host_ip(monkeypatch):
+    """WSL should rewrite host.docker.internal to the Windows host gateway IP."""
+    monkeypatch.setattr(rp, "_is_wsl", lambda: True)
+    monkeypatch.setattr(rp, "_wsl_windows_host_ip", lambda: "172.29.192.1")
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "custom",
+            "base_url": "http://host.docker.internal:11434/v1",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+
+    resolved = rp.resolve_runtime_provider(requested="custom")
+
+    assert resolved["base_url"] == "http://172.29.192.1:11434/v1"
+
+
 def test_trustworthy_check_accepts_custom_aliases():
     """_config_base_url_trustworthy_for_bare_custom() must accept aliases for custom."""
     fn = rp._config_base_url_trustworthy_for_bare_custom

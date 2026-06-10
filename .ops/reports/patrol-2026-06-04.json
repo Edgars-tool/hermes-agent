@@ -1,0 +1,18 @@
+﻿{
+    "date":  "2026-06-04",
+    "timestamp":  "2026-06-04 15:57:17",
+    "mode":  "SessionStart",
+    "workspace":  "V:\\Projects\\hermes-agent",
+    "repoName":  "hermes-agent",
+    "rootFileCount":  57,
+    "rootDirCount":  32,
+    "dailyNote":  "V:\\Projects\\hermes-agent\\.ops\\daily\\2026-06-04.md",
+    "issueCandidates":  [
+                            {
+                                "title":  "Root 檔案過多，建議做分層整理",
+                                "detail":  "目前 root 檔案數 57，建議將維護文件與臨時輸出移入 docs/ 或 .ops/",
+                                "severity":  "medium",
+                                "category":  "architecture"
+                            }
+                        ]
+}

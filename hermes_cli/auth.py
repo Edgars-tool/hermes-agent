@@ -31,6 +31,7 @@ import stat
 import sys
 import base64
 import hashlib
+import socket
 import subprocess
 import threading
 import time
@@ -113,6 +114,8 @@ STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+CODEX_DEVICE_CODE_NETWORK_RETRY_ATTEMPTS = 3
+CODEX_DEVICE_CODE_NETWORK_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 XAI_OAUTH_ISSUER = "https://auth.x.ai"
 XAI_OAUTH_DISCOVERY_URL = f"{XAI_OAUTH_ISSUER}/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -6733,6 +6736,87 @@ def _xai_oauth_loopback_login(
     }
 
 
+def _codex_is_transient_network_error(exc: Exception) -> bool:
+    """Return True when a Codex auth HTTP request failed for a retryable reason."""
+    if not isinstance(exc, httpx.RequestError):
+        return False
+
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
+        return True
+
+    def _looks_like_dns_failure(error: BaseException) -> bool:
+        if isinstance(error, socket.gaierror):
+            return True
+        if isinstance(error, OSError) and getattr(error, "errno", None) in {-2, -3, 11001, 11004}:
+            return True
+        message = str(error)
+        lowered = message.lower()
+        return (
+            "temporary failure in name resolution" in lowered
+            or "name or service not known" in lowered
+            or "no address associated with hostname" in lowered
+        )
+
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _looks_like_dns_failure(current):
+            return True
+        current = current.__cause__ or current.__context__
+
+    return False
+
+
+def _codex_post_with_retry(
+    client: httpx.Client,
+    *,
+    url: str,
+    operation: str,
+    error_code: str,
+    payload: Dict[str, Any],
+) -> httpx.Response:
+    """POST with a tiny retry window for transient DNS / network failures."""
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, CODEX_DEVICE_CODE_NETWORK_RETRY_ATTEMPTS + 1):
+        try:
+            return client.post(url, **payload)
+        except httpx.RequestError as exc:
+            last_exc = exc
+            transient = _codex_is_transient_network_error(exc)
+            if not transient or attempt >= CODEX_DEVICE_CODE_NETWORK_RETRY_ATTEMPTS:
+                hint = ""
+                if transient:
+                    hint = " This looks like a transient DNS/network issue; please fix connectivity and retry."
+                raise AuthError(
+                    f"Failed to {operation}: {exc}.{hint}",
+                    provider="openai-codex",
+                    code=error_code,
+                ) from exc
+
+            delay = CODEX_DEVICE_CODE_NETWORK_RETRY_DELAYS_SECONDS[min(
+                attempt - 1,
+                len(CODEX_DEVICE_CODE_NETWORK_RETRY_DELAYS_SECONDS) - 1,
+            )]
+            logger.warning(
+                "OpenAI Codex %s failed due to a transient network error (%s); retrying in %.1fs (%d/%d)",
+                operation,
+                exc,
+                delay,
+                attempt,
+                CODEX_DEVICE_CODE_NETWORK_RETRY_ATTEMPTS,
+            )
+            time.sleep(delay)
+
+    assert last_exc is not None
+    raise AuthError(
+        f"Failed to {operation}: {last_exc}",
+        provider="openai-codex",
+        code=error_code,
+    ) from last_exc
+
+
 def _codex_device_code_login() -> Dict[str, Any]:
     """Run the OpenAI device code login flow and return credentials dict."""
     import time as _time
@@ -6741,17 +6825,16 @@ def _codex_device_code_login() -> Dict[str, Any]:
     client_id = CODEX_OAUTH_CLIENT_ID
 
     # Step 1: Request device code
-    try:
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            resp = client.post(
-                f"{issuer}/api/accounts/deviceauth/usercode",
-                json={"client_id": client_id},
-                headers={"Content-Type": "application/json"},
-            )
-    except Exception as exc:
-        raise AuthError(
-            f"Failed to request device code: {exc}",
-            provider="openai-codex", code="device_code_request_failed",
+    with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+        resp = _codex_post_with_retry(
+            client,
+            url=f"{issuer}/api/accounts/deviceauth/usercode",
+            operation="request device code",
+            error_code="device_code_request_failed",
+            payload={
+                "json": {"client_id": client_id},
+                "headers": {"Content-Type": "application/json"},
+            },
         )
 
     if resp.status_code != 200:
@@ -6788,11 +6871,23 @@ def _codex_device_code_login() -> Dict[str, Any]:
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
             while _time.monotonic() - start < max_wait:
                 _time.sleep(poll_interval)
-                poll_resp = client.post(
-                    f"{issuer}/api/accounts/deviceauth/token",
-                    json={"device_auth_id": device_auth_id, "user_code": user_code},
-                    headers={"Content-Type": "application/json"},
-                )
+                try:
+                    poll_resp = client.post(
+                        f"{issuer}/api/accounts/deviceauth/token",
+                        json={"device_auth_id": device_auth_id, "user_code": user_code},
+                        headers={"Content-Type": "application/json"},
+                    )
+                except httpx.RequestError as exc:
+                    if _codex_is_transient_network_error(exc):
+                        logger.warning(
+                            "OpenAI Codex device-code polling hit a transient network error (%s); continuing to poll.",
+                            exc,
+                        )
+                        continue
+                    raise AuthError(
+                        f"Device auth polling failed: {exc}",
+                        provider="openai-codex", code="device_code_poll_error",
+                    ) from exc
 
                 if poll_resp.status_code == 200:
                     code_resp = poll_resp.json()
@@ -6827,22 +6922,29 @@ def _codex_device_code_login() -> Dict[str, Any]:
 
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            token_resp = client.post(
-                CODEX_OAUTH_TOKEN_URL,
-                data={
-                    "grant_type": "authorization_code",
-                    "code": authorization_code,
-                    "redirect_uri": redirect_uri,
-                    "client_id": client_id,
-                    "code_verifier": code_verifier,
+            token_resp = _codex_post_with_retry(
+                client,
+                url=CODEX_OAUTH_TOKEN_URL,
+                operation="exchange device auth code for tokens",
+                error_code="token_exchange_failed",
+                payload={
+                    "data": {
+                        "grant_type": "authorization_code",
+                        "code": authorization_code,
+                        "redirect_uri": redirect_uri,
+                        "client_id": client_id,
+                        "code_verifier": code_verifier,
+                    },
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
     except Exception as exc:
+        if isinstance(exc, AuthError):
+            raise
         raise AuthError(
             f"Token exchange failed: {exc}",
             provider="openai-codex", code="token_exchange_failed",
-        )
+        ) from exc
 
     if token_resp.status_code != 200:
         raise AuthError(

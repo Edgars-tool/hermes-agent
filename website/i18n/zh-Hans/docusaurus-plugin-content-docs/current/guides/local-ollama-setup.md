@@ -114,6 +114,18 @@ model:
   base_url: "http://localhost:11434/v1"
 ```
 
+:::tip WSL 用户且 Ollama 跑在 Windows 上
+如果 Hermes 在 WSL2 内，而 Ollama 跑在 Windows 主机上，`localhost` 只有在启用 WSL mirrored networking 时才会正常工作。若你连不上，请在 WSL 里改用 Windows 主机 IP，而不是 `localhost`：
+
+```bash
+ip route show | grep -i default | awk '{ print $3 }'
+```
+
+然后把 `base_url` 设成类似 `http://172.29.192.1:11434/v1`。
+
+`host.docker.internal` 常见于 Docker 场景，但它不是 WSL 里稳定可靠的别名，除非你的环境本来就能解析它。
+:::
+
 ## 第四步：开始使用 Hermes
 
 ```bash

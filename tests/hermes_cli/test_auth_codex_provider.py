@@ -6,6 +6,7 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import yaml
 
@@ -17,6 +18,7 @@ from hermes_cli.auth import (
     _save_codex_tokens,
     _import_codex_cli_tokens,
     _login_openai_codex,
+    _codex_device_code_login,
     get_codex_auth_status,
     get_provider_auth_state,
     refresh_codex_oauth_pure,
@@ -228,6 +230,27 @@ def _patch_httpx(monkeypatch, response):
     monkeypatch.setattr("hermes_cli.auth.httpx.Client", _factory)
 
 
+class _SequencedHTTPClient:
+    def __init__(self, responses, calls):
+        self._responses = responses
+        self.calls = calls
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if not self._responses:
+            raise AssertionError("No more stub responses available")
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
 def test_refresh_parses_openai_nested_error_shape_refresh_token_reused(monkeypatch):
     """OpenAI returns {"error": {"code": "refresh_token_reused", "message": "..."}}
     — parser must surface relogin_required and the dedicated message.
@@ -351,3 +374,44 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
 
     assert called["device_login"] == 1
     assert called["tokens"]["access_token"] == "fresh-at"
+
+
+def test_codex_device_code_login_retries_transient_dns_failure(monkeypatch):
+    responses = [
+        httpx.ConnectError("dns failure"),
+        httpx.ConnectError("dns failure"),
+        _StubHTTPResponse(
+            200,
+            {
+                "user_code": "ABCD-EFGH",
+                "device_auth_id": "device-123",
+                "interval": 1,
+            },
+        ),
+        _StubHTTPResponse(
+            200,
+            {
+                "authorization_code": "auth-code",
+                "code_verifier": "verifier-123",
+            },
+        ),
+        _StubHTTPResponse(
+            200,
+            {
+                "access_token": "at-new",
+                "refresh_token": "rt-new",
+            },
+        ),
+    ]
+    calls = []
+
+    def _factory(*args, **kwargs):
+        return _SequencedHTTPClient(responses, calls)
+
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", _factory)
+    monkeypatch.setattr("hermes_cli.auth.time.sleep", lambda *args, **kwargs: None)
+
+    creds = _codex_device_code_login()
+
+    assert creds["tokens"]["access_token"] == "at-new"
+    assert len(calls) == 5
